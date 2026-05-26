@@ -4228,6 +4228,704 @@ app.get('/driver/my-trips', verifyToken, allowRoles('driver'), (req, res) => {
   });
 });
 
+
+// Add to your backend server.js
+
+// Get driver's assigned car with launch info
+app.get('/driver/my-assigned-car', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            da.car_plate,
+            da.launch_car_id,
+            da.status as assignment_status,
+            cc.id as car_id,
+            cc.car_name,
+            cc.total_sits,
+            lc.travel_time,
+            lc.available_sits,
+            l.id as location_id,
+            l.travel_from,
+            l.travel_to,
+            l.price_amount
+        FROM driver_assignments da
+        LEFT JOIN company_cars cc ON da.car_plate = cc.car_plate
+        LEFT JOIN launch_cars lc ON da.launch_car_id = lc.id
+        LEFT JOIN locations l ON lc.location_id = l.id
+        WHERE da.driver_id = ? AND da.status = 'active'
+        ORDER BY lc.travel_time ASC
+        LIMIT 1
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            console.error("Error getting assigned car:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result[0] || null);
+    });
+});
+
+// Get tickets for driver's assigned car
+app.get('/driver/my-tickets', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            pt.*,
+            l.travel_from,
+            l.travel_to,
+            l.price_amount as route_price,
+            vt.verification_code
+        FROM passenger_ticket pt
+        LEFT JOIN locations l ON pt.location_id = l.id
+        LEFT JOIN verification_tokens vt ON vt.passenger_ticket_id = pt.id
+        JOIN launch_cars lc ON pt.launch_car_id = lc.id
+        JOIN driver_assignments da ON da.launch_car_id = lc.id
+        WHERE da.driver_id = ? AND da.status = 'active'
+        ORDER BY 
+            CASE pt.ticket_life_cycle 
+                WHEN 'active' THEN 1 
+                WHEN 'used' THEN 2 
+                ELSE 3 
+            END,
+            pt.id DESC
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            console.error("Error getting driver tickets:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result);
+    });
+});
+
+
+// =====================================================
+// GET DRIVER LOCATIONS FOR MANAGER (WITH COORDINATES)
+// =====================================================
+app.get('/manager/driver-locations', verifyToken, allowRoles('company-manager'), (req, res) => {
+    const companyId = req.user.company_id;
+    
+    const sql = `
+        SELECT 
+            dl.id,
+            dl.driver_id,
+            dl.latitude,
+            dl.longitude,
+            dl.location_name,
+            dl.status,
+            dl.current_route,
+            dl.last_update,
+            cd.driver_name,
+            cd.phone_number,
+            COALESCE(cc.car_plate, 'Not Assigned') as car_plate,
+            COALESCE(cc.car_name, 'No Vehicle') as car_name,
+            CASE 
+                WHEN dl.last_update > DATE_SUB(NOW(), INTERVAL 5 MINUTE) THEN 'active'
+                WHEN dl.last_update > DATE_SUB(NOW(), INTERVAL 15 MINUTE) THEN 'inactive'
+                ELSE 'offline'
+            END as connection_status,
+            ROUND(
+                6371 * 2 * ASIN(
+                    SQRT(
+                        POWER(SIN((dl.latitude - 0) * PI() / 180 / 2), 2) +
+                        COS(dl.latitude * PI() / 180) * COS(0 * PI() / 180) *
+                        POWER(SIN((dl.longitude - 0) * PI() / 180 / 2), 2)
+                    )
+                ), 2
+            ) as last_known_distance
+        FROM driver_locations dl
+        JOIN company_driver cd ON dl.driver_id = cd.id
+        JOIN users u ON cd.user_id = u.id
+        LEFT JOIN company_cars cc ON cc.user_id = u.id AND cc.status = 'available'
+        WHERE u.company_id = ?
+        ORDER BY dl.last_update DESC
+    `;
+    
+    db.query(sql, [companyId], (err, result) => {
+        if (err) {
+            console.error("Driver locations error:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        
+        // Format coordinates to 6 decimal places
+        const formattedResults = result.map(driver => ({
+            ...driver,
+            latitude: driver.latitude ? parseFloat(driver.latitude).toFixed(6) : null,
+            longitude: driver.longitude ? parseFloat(driver.longitude).toFixed(6) : null,
+            google_maps_url: driver.latitude && driver.longitude 
+                ? `https://www.google.com/maps?q=${driver.latitude},${driver.longitude}`
+                : null,
+            openstreetmap_url: driver.latitude && driver.longitude
+                ? `https://www.openstreetmap.org/?mlat=${driver.latitude}&mlon=${driver.longitude}#map=15/${driver.latitude}/${driver.longitude}`
+                : null
+        }));
+        
+        res.json(formattedResults);
+    });
+});
+
+// =====================================================
+// COMPLETE DRIVER DASHBOARD BACKEND ENDPOINTS
+// =====================================================
+
+// 1. GET DRIVER'S CURRENT ASSIGNMENT (Single Car Only)
+app.get('/driver/my-assigned-car', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            da.id as assignment_id,
+            da.car_plate,
+            da.launch_car_id,
+            da.assigned_at,
+            da.status as assignment_status,
+            cc.id as car_id,
+            cc.car_name,
+            cc.total_sits,
+            cc.status as car_status,
+            lc.id as launch_id,
+            lc.travel_time,
+            lc.available_sits,
+            lc.status as launch_status,
+            l.id as location_id,
+            l.travel_from,
+            l.travel_to,
+            l.price_amount
+        FROM driver_assignments da
+        LEFT JOIN company_cars cc ON da.car_plate = cc.car_plate
+        LEFT JOIN launch_cars lc ON da.launch_car_id = lc.id
+        LEFT JOIN locations l ON lc.location_id = l.id
+        WHERE da.driver_id = ? AND da.status = 'active'
+        ORDER BY lc.travel_time ASC
+        LIMIT 1
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            console.error("Error getting assigned car:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result[0] || null);
+    });
+});
+
+// 2. GET DRIVER'S TICKETS (Active, Used, Expired)
+app.get('/driver/my-tickets', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            pt.id,
+            pt.passenger_name,
+            pt.phone_number,
+            pt.ticket_life_cycle,
+            pt.price,
+            pt.car_plate,
+            pt.travel_time,
+            pt.payment_method,
+            pt.created_at,
+            l.travel_from,
+            l.travel_to,
+            l.price_amount as route_price,
+            vt.verification_code,
+            vt.status as verification_status
+        FROM passenger_ticket pt
+        LEFT JOIN locations l ON pt.location_id = l.id
+        LEFT JOIN verification_tokens vt ON vt.passenger_ticket_id = pt.id
+        JOIN launch_cars lc ON pt.launch_car_id = lc.id
+        JOIN driver_assignments da ON da.launch_car_id = lc.id
+        WHERE da.driver_id = ? AND da.status = 'active'
+        ORDER BY 
+            CASE pt.ticket_life_cycle 
+                WHEN 'active' THEN 1 
+                WHEN 'used' THEN 2 
+                ELSE 3 
+            END,
+            pt.id DESC
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            console.error("Error getting driver tickets:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        
+        // Calculate stats
+        const stats = {
+            total: result.length,
+            active: result.filter(t => t.ticket_life_cycle === 'active').length,
+            used: result.filter(t => t.ticket_life_cycle === 'used').length,
+            expired: result.filter(t => t.ticket_life_cycle === 'expired').length
+        };
+        
+        res.json({
+            tickets: result,
+            stats: stats
+        });
+    });
+});
+
+// 3. GET DRIVER'S TRIPS (Assigned Trips)
+app.get('/driver/trips', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            lc.id as launch_car_id,
+            lc.car_plate,
+            lc.travel_time,
+            lc.available_sits,
+            lc.status as launch_status,
+            l.id as location_id,
+            l.travel_from,
+            l.travel_to,
+            l.price_amount,
+            cc.car_name,
+            cc.total_sits,
+            COALESCE(
+                (SELECT COUNT(*) 
+                 FROM passenger_ticket pt 
+                 WHERE pt.launch_car_id = lc.id 
+                 AND pt.ticket_life_cycle = 'active'), 0
+            ) as passenger_count
+        FROM driver_assignments da
+        JOIN launch_cars lc ON da.launch_car_id = lc.id
+        JOIN locations l ON lc.location_id = l.id
+        JOIN company_cars cc ON lc.car_plate = cc.car_plate
+        WHERE da.driver_id = ? AND da.status = 'active'
+        ORDER BY lc.travel_time ASC
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            console.error("Error fetching driver trips:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result);
+    });
+});
+
+// 4. GET AVAILABLE LAUNCHES FOR ASSIGNMENT
+app.get('/driver/available-launches', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    // First get driver's company_id
+    const getCompanySql = `
+        SELECT u.company_id 
+        FROM company_driver cd 
+        JOIN users u ON cd.user_id = u.id 
+        WHERE cd.id = ?
+    `;
+    
+    db.query(getCompanySql, [driverId], (err, companyResult) => {
+        if (err) {
+            console.error("Error getting company:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        
+        if (companyResult.length === 0) {
+            return res.json([]);
+        }
+        
+        const companyId = companyResult[0].company_id;
+        
+        // Get launches NOT assigned to any driver
+        const sql = `
+            SELECT 
+                lc.id as launch_car_id,
+                lc.car_plate,
+                lc.travel_time,
+                lc.available_sits,
+                lc.status as launch_status,
+                cc.id as car_id,
+                cc.car_name,
+                cc.total_sits,
+                l.id as location_id,
+                l.travel_from,
+                l.travel_to,
+                l.price_amount,
+                c.name as company_name
+            FROM launch_cars lc
+            INNER JOIN company_cars cc ON lc.car_plate = cc.car_plate
+            INNER JOIN users u ON cc.user_id = u.id
+            INNER JOIN locations l ON lc.location_id = l.id
+            INNER JOIN company c ON u.company_id = c.id
+            WHERE u.company_id = ? 
+                AND lc.status = 'active'
+                AND lc.travel_time > NOW()
+                AND lc.available_sits > 0
+                AND lc.id NOT IN (
+                    SELECT launch_car_id FROM driver_assignments WHERE status = 'active'
+                )
+            ORDER BY lc.travel_time ASC
+        `;
+        
+        db.query(sql, [companyId], (err2, result) => {
+            if (err2) {
+                console.error("Error fetching available launches:", err2);
+                return res.status(500).json({ success: false, error: err2.message });
+            }
+            res.json(result);
+        });
+    });
+});
+
+// 5. ASSIGN LAUNCH TO DRIVER (Single assignment only)
+app.post('/driver/assign-launch', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    const { launch_id } = req.body;
+    
+    if (!launch_id) {
+        return res.status(400).json({ success: false, message: "Launch ID required" });
+    }
+    
+    // First, check if launch exists and is available
+    db.query(
+        `SELECT lc.*, cc.car_plate, cc.car_name 
+         FROM launch_cars lc
+         JOIN company_cars cc ON lc.car_plate = cc.car_plate
+         WHERE lc.id = ? AND lc.status = 'active' AND lc.travel_time > NOW()`,
+        [launch_id],
+        (err, launchResult) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            if (launchResult.length === 0) {
+                return res.status(404).json({ 
+                    success: false, 
+                    message: "Launch not available" 
+                });
+            }
+            
+            const launch = launchResult[0];
+            
+            // Check if driver already has an assignment
+            db.query(
+                `SELECT * FROM driver_assignments WHERE driver_id = ? AND status = 'active'`,
+                [driverId],
+                (assignErr, assignResult) => {
+                    if (assignErr) {
+                        return res.status(500).json({ success: false, error: assignErr.message });
+                    }
+                    
+                    if (assignResult.length > 0) {
+                        // Update existing assignment
+                        db.query(
+                            `UPDATE driver_assignments 
+                             SET car_plate = ?, launch_car_id = ?, assigned_at = NOW() 
+                             WHERE driver_id = ? AND status = 'active'`,
+                            [launch.car_plate, launch_id, driverId],
+                            (updateErr) => {
+                                if (updateErr) {
+                                    return res.status(500).json({ success: false, error: updateErr.message });
+                                }
+                                
+                                res.json({ 
+                                    success: true, 
+                                    message: "Assignment updated successfully",
+                                    assignment: {
+                                        car_plate: launch.car_plate,
+                                        car_name: launch.car_name,
+                                        travel_from: launch.travel_from,
+                                        travel_to: launch.travel_to,
+                                        travel_time: launch.travel_time
+                                    }
+                                });
+                            }
+                        );
+                    } else {
+                        // Create new assignment
+                        db.query(
+                            `INSERT INTO driver_assignments (driver_id, car_plate, launch_car_id, assigned_at, status) 
+                             VALUES (?, ?, ?, NOW(), 'active')`,
+                            [driverId, launch.car_plate, launch_id],
+                            (insertErr) => {
+                                if (insertErr) {
+                                    return res.status(500).json({ success: false, error: insertErr.message });
+                                }
+                                
+                                res.json({ 
+                                    success: true, 
+                                    message: "Launch assigned successfully",
+                                    assignment: {
+                                        car_plate: launch.car_plate,
+                                        car_name: launch.car_name,
+                                        travel_from: launch.travel_from,
+                                        travel_to: launch.travel_to,
+                                        travel_time: launch.travel_time
+                                    }
+                                });
+                            }
+                        );
+                    }
+                }
+            );
+        }
+    );
+});
+
+// 6. START TRIP
+app.post('/driver/start-trip', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    const { launch_id, started_at } = req.body;
+    
+    db.query(
+        `UPDATE launch_cars 
+         SET trip_status = 'active', 
+             actual_departure_time = ?, 
+             started_by_driver_id = ?
+         WHERE id = ? AND assigned_driver_id = ? AND trip_status = 'scheduled'`,
+        [started_at, driverId, launch_id, driverId],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            if (result.affectedRows === 0) {
+                return res.status(400).json({ success: false, message: "Cannot start trip" });
+            }
+            
+            res.json({ success: true, message: "Trip started successfully" });
+        }
+    );
+});
+
+// 7. END TRIP
+app.post('/driver/end-trip', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    const { launch_id, arrived_at } = req.body;
+    
+    db.query(
+        `UPDATE launch_cars 
+         SET trip_status = 'completed', 
+             actual_arrival_time = ?, 
+             completed_by_driver_id = ?
+         WHERE id = ? AND assigned_driver_id = ? AND trip_status = 'active'`,
+        [arrived_at, driverId, launch_id, driverId],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            res.json({ success: true, message: "Trip completed successfully" });
+        }
+    );
+});
+
+// 8. MARK PASSENGERS ARRIVED (Expire Tickets)
+app.post('/driver/mark-arrived', verifyToken, allowRoles('driver'), (req, res) => {
+    const { passenger_ids, location_name } = req.body;
+    
+    if (!passenger_ids || passenger_ids.length === 0) {
+        return res.status(400).json({ success: false, message: "No passengers selected" });
+    }
+    
+    const placeholders = passenger_ids.map(() => '?').join(',');
+    const sql = `
+        UPDATE passenger_ticket 
+        SET ticket_life_cycle = 'expired',
+            actual_dropoff_time = NOW(),
+            dropoff_location = ?
+        WHERE id IN (${placeholders}) AND ticket_life_cycle = 'active'
+    `;
+    
+    db.query(sql, [location_name, ...passenger_ids], (err, result) => {
+        if (err) {
+            console.error("Error marking arrived:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        
+        res.json({ 
+            success: true, 
+            message: `${result.affectedRows} passengers marked as arrived at ${location_name}`,
+            affectedCount: result.affectedRows
+        });
+    });
+});
+
+// 9. VERIFY TICKET (Driver verifies passenger)
+app.post('/driver/verify-ticket', verifyToken, allowRoles('driver'), (req, res) => {
+    const { ticket_id } = req.body;
+    
+    db.query(
+        `UPDATE passenger_ticket 
+         SET verified_by_driver = TRUE,
+             verified_at = NOW()
+         WHERE id = ? AND ticket_life_cycle = 'active'`,
+        [ticket_id],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            res.json({ success: true, message: "Passenger verified" });
+        }
+    );
+});
+
+// 10. DELETE EXPIRED TRIP (Driver can delete expired trips)
+app.delete('/driver/trip/:trip_id', verifyToken, allowRoles('driver'), (req, res) => {
+    const { trip_id } = req.params;
+    const driverId = req.user.id;
+    
+    // Check if trip belongs to driver and is expired
+    db.query(
+        `SELECT lc.* FROM launch_cars lc
+         JOIN driver_assignments da ON da.launch_car_id = lc.id
+         WHERE lc.id = ? AND da.driver_id = ? AND lc.travel_time < NOW()`,
+        [trip_id, driverId],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            if (result.length === 0) {
+                return res.status(404).json({ success: false, message: "Trip not found or not expired" });
+            }
+            
+            // Delete the trip
+            db.query(
+                `DELETE FROM launch_cars WHERE id = ?`,
+                [trip_id],
+                (deleteErr) => {
+                    if (deleteErr) {
+                        return res.status(500).json({ success: false, error: deleteErr.message });
+                    }
+                    
+                    res.json({ success: true, message: "Expired trip deleted successfully" });
+                }
+            );
+        }
+    );
+});
+
+// 11. GET ALL ROUTES (Locations)
+app.get('/driver/routes', verifyToken, allowRoles('driver'), (req, res) => {
+    db.query(
+        `SELECT * FROM locations ORDER BY travel_from ASC`,
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            res.json(result);
+        }
+    );
+});
+
+// 12. UPDATE DRIVER LOCATION WITH MOVEMENT STATUS
+app.post('/driver/location', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    const { latitude, longitude, location_name, status, current_route, speed, is_moving } = req.body;
+    
+    const sql = `
+        INSERT INTO driver_locations (
+            driver_id, latitude, longitude, location_name, status, 
+            current_route, speed, is_moving, last_update
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        ON DUPLICATE KEY UPDATE
+            latitude = VALUES(latitude),
+            longitude = VALUES(longitude),
+            location_name = VALUES(location_name),
+            status = VALUES(status),
+            current_route = VALUES(current_route),
+            speed = VALUES(speed),
+            is_moving = VALUES(is_moving),
+            last_update = NOW()
+    `;
+    
+    db.query(sql, [driverId, latitude, longitude, location_name, status, current_route, speed || 0, is_moving || false], (err) => {
+        if (err) {
+            console.error("Location update error:", err);
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json({ success: true, message: "Location updated", speed: speed || 0, is_moving: is_moving || false });
+    });
+});
+
+// 13. GET DRIVER STATS (Dashboard Stats)
+app.get('/driver/stats', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT 
+            (SELECT COUNT(*) FROM driver_assignments WHERE driver_id = ? AND status = 'active') as total_assignments,
+            (SELECT COUNT(*) FROM launch_cars lc JOIN driver_assignments da ON da.launch_car_id = lc.id WHERE da.driver_id = ? AND lc.trip_status = 'completed') as completed_trips,
+            (SELECT COUNT(*) FROM launch_cars lc JOIN driver_assignments da ON da.launch_car_id = lc.id WHERE da.driver_id = ? AND lc.trip_status = 'active') as active_trips,
+            (SELECT COUNT(*) FROM passenger_ticket pt JOIN launch_cars lc ON pt.launch_car_id = lc.id JOIN driver_assignments da ON da.launch_car_id = lc.id WHERE da.driver_id = ? AND pt.ticket_life_cycle = 'active') as active_passengers,
+            (SELECT COUNT(*) FROM passenger_ticket pt JOIN launch_cars lc ON pt.launch_car_id = lc.id JOIN driver_assignments da ON da.launch_car_id = lc.id WHERE da.driver_id = ? AND pt.ticket_life_cycle = 'expired') as delivered_passengers,
+            (SELECT SUM(price) FROM passenger_ticket pt JOIN launch_cars lc ON pt.launch_car_id = lc.id JOIN driver_assignments da ON da.launch_car_id = lc.id WHERE da.driver_id = ?) as total_revenue
+    `;
+    
+    db.query(sql, [driverId, driverId, driverId, driverId, driverId, driverId], (err, result) => {
+        if (err) {
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result[0] || {
+            total_assignments: 0,
+            completed_trips: 0,
+            active_trips: 0,
+            active_passengers: 0,
+            delivered_passengers: 0,
+            total_revenue: 0
+        });
+    });
+});
+
+// 14. GET DRIVER PROFILE
+app.get('/driver/profile', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    
+    const sql = `
+        SELECT cd.*, u.email, u.company_id, c.name as company_name
+        FROM company_driver cd
+        JOIN users u ON cd.user_id = u.id
+        LEFT JOIN company c ON u.company_id = c.id
+        WHERE cd.id = ?
+    `;
+    
+    db.query(sql, [driverId], (err, result) => {
+        if (err) {
+            return res.status(500).json({ success: false, error: err.message });
+        }
+        res.json(result[0] || null);
+    });
+});
+
+// 15. UPDATE DRIVER PROFILE
+app.put('/driver/profile', verifyToken, allowRoles('driver'), (req, res) => {
+    const driverId = req.user.id;
+    const { phone_number, email } = req.body;
+    
+    // Update driver phone
+    db.query(
+        `UPDATE company_driver SET phone_number = ? WHERE id = ?`,
+        [phone_number, driverId],
+        (err) => {
+            if (err) {
+                return res.status(500).json({ success: false, error: err.message });
+            }
+            
+            // Update user email if exists
+            db.query(
+                `UPDATE users SET email = ? WHERE id = (SELECT user_id FROM company_driver WHERE id = ?)`,
+                [email, driverId],
+                (err2) => {
+                    if (err2) {
+                        return res.status(500).json({ success: false, error: err2.message });
+                    }
+                    res.json({ success: true, message: "Profile updated" });
+                }
+            );
+        }
+    );
+});
+
 // =====================================================
 // SERVER
 // =====================================================
